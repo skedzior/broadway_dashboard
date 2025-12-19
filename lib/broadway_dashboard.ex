@@ -18,8 +18,18 @@ defmodule BroadwayDashboard do
   @impl true
   def init(opts) do
     pipelines = opts[:pipelines] || :auto_discover
+    pipeline_type = opts[:pipeline_type] || :broadway
+    data_types = opts[:data_types]
+    topology = opts[:topology]
 
-    {:ok, %{pipelines: pipelines}, application: :broadway}
+    session = %{
+      pipelines: pipelines,
+      pipeline_type: pipeline_type,
+      data_types: data_types,
+      topology: topology
+    }
+
+    {:ok, session, application: :broadway}
   end
 
   @impl true
@@ -63,7 +73,15 @@ defmodule BroadwayDashboard do
   end
 
   @impl true
-  def mount(params, %{pipelines: pipelines}, socket) do
+  def mount(params, %{pipeline_type: :genstage} = session, socket) do
+    mount_genstage(params, session, socket)
+  end
+
+  def mount(params, session, socket) do
+    mount_broadway(params, session, socket)
+  end
+
+  defp mount_broadway(params, %{pipelines: pipelines}, socket) do
     case pipelines_or_auto_discover(pipelines, socket.assigns.page.node) do
       {:ok, pipelines} ->
         socket = assign(socket, :pipelines, pipelines)
@@ -85,7 +103,68 @@ defmodule BroadwayDashboard do
 
               layers = PipelineGraph.build_layers(initial_payload.topology_workload)
 
-              {:ok, assign(socket, pipeline: pipeline, stats: stats, layers: layers)}
+              {:ok,
+               assign(socket,
+                 pipeline: pipeline,
+                 pipeline_type: :broadway,
+                 stats: stats,
+                 layers: layers
+               )}
+            else
+              {:error, error} ->
+                {:ok, assign(socket, pipeline: nil, error: error)}
+            end
+
+          true ->
+            nav = pipelines |> hd() |> inspect()
+            to = live_dashboard_path(socket, socket.assigns.page, nav: nav)
+            {:ok, push_navigate(socket, to: to)}
+        end
+
+      {:error, error} ->
+        {:ok, assign(socket, pipeline: nil, error: error)}
+    end
+  end
+
+  defp mount_genstage(params, session, socket) do
+    %{pipelines: pipelines, data_types: data_types, topology: topology} = session
+
+    case pipelines_or_auto_discover(pipelines, socket.assigns.page.node) do
+      {:ok, pipelines} ->
+        socket = assign(socket, :pipelines, pipelines)
+        pipeline = nav_pipeline(params, pipelines)
+
+        cond do
+          pipeline ->
+            node = socket.assigns.page.node
+
+            with :ok <- check_socket_connection(socket),
+                 {:ok, initial_payload} <-
+                   BroadwayDashboard.GenStage.Metrics.listen(node, self(), pipeline,
+                     data_types: data_types,
+                     topology: topology
+                   ) do
+              stats = %{
+                successful: initial_payload.successful,
+                failed: initial_payload.failed,
+                throughput_successful: 0,
+                throughput_failed: 0
+              }
+
+              layers =
+                BroadwayDashboard.GenStage.PipelineGraph.build_layers(
+                  initial_payload.topology_workload
+                )
+
+              {:ok,
+               assign(socket,
+                 pipeline: pipeline,
+                 pipeline_type: :genstage,
+                 data_types: data_types,
+                 topology: topology,
+                 stats: stats,
+                 layers: layers
+               )}
             else
               {:error, error} ->
                 {:ok, assign(socket, pipeline: nil, error: error)}
@@ -128,7 +207,14 @@ defmodule BroadwayDashboard do
         throughput_failed: payload.failed - previous_stats.failed
       }
 
-      layers = PipelineGraph.build_layers(payload.topology_workload)
+      layers =
+        case socket.assigns[:pipeline_type] do
+          :genstage ->
+            BroadwayDashboard.GenStage.PipelineGraph.build_layers(payload.topology_workload)
+
+          _ ->
+            PipelineGraph.build_layers(payload.topology_workload)
+        end
 
       {:noreply, assign(socket, stats: stats, layers: layers)}
     else
